@@ -1,0 +1,975 @@
+---
+title: "final_project_ahmad_tokey"
+date: "2022-11-15"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+
+
+---
+
+```{r setup, include=FALSE, }
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# setting up the environment
+
+```{r}
+#install.packages("pak")
+#pak::pkg_install("r-lib/rlang")
+
+#install.packages("devtools")
+#install.packages("C:/Users/tokey/Downloads/cli_3.4.1.tar.gz", repos=NULL, type = "source")
+#devtools::install_github("r-lib/vctrs")
+
+#install.packages("C:/Users/tokey/Downloads/rlang_1.0.6.tar.gz", type = "source")
+#library(rlang)
+library(lubridate)
+library(sf)
+library(tidyverse)
+library(tmap) #plot map
+library(tidycensus) #acs data
+library(tigris)   # shapefiles
+library(dplyr)
+library(rgeos)
+library(rgdal)
+library(raster)
+library(lattice)
+library(ncdf4)
+library(corrplot)
+library(ggpubr)
+library(exactextractr) # calculate zonal statistics with raster data
+
+library(corrplot) # for correlation plot
+
+# Import lattice
+library(lattice)
+library(grid)
+library(GISTools)
+#install.packages("fastDummies")
+library(fastDummies)
+```
+
+
+```{r}
+#setting working directory
+
+setwd("C:/study/1_OSU/fall 22/lab2/final project")
+```
+
+# Getting started with food inspection data
+
+```{r}
+#import the csv data 
+raw_fi <- read.csv("Food_Inspections.csv")
+```
+
+
+```{r}
+#examine the data
+colnames(raw_fi) #check the name of column containing latlong
+
+class(raw_fi$Latitude) #check the data type of latlong
+class(raw_fi$Longitude)
+
+summary(raw_fi$Latitude) #check how many NA values are there
+summary(raw_fi$Longitude)
+```
+
+
+```{r}
+
+# get the date field in right format
+raw_fi$Inspection.Date <- as.Date(raw_fi$Inspection.Date, "%m/%d/%Y")
+
+#number of rows
+nrow(raw_fi) 
+```
+
+
+```{r}
+# plotting number of records by year
+raw_fi$year <- format(raw_fi$Inspection.Date,"%Y") 
+
+sum_yr <- as.data.frame(table(raw_fi$year))
+
+head(sum_yr)
+
+#barchart(Freq~Var1, data=sum_yr)
+
+ggplot(raw_fi, aes(x=year)) + geom_bar()
+```
+
+# Filtering and exploring food inspection data
+So, we choose to work with 2019 data. The reason is that it is the most recent data before COVID-19. 
+So, from here we would like to take Bakery and Grocery Store. Restaurant could be another choice, but we want to leave it given the timeframe and scope of this project. We are also specific about three inspection results that are pass, fail, and conditionally pass. Now there are many cases where one facility was inspected multiple times. To get things simpler, we retain only the first inspection result of 2019 for each facility. Finally, we will drop the NA values and make an sf object. 
+
+
+```{r}
+fi_19 <- raw_fi %>% 
+  filter(year=="2019") %>% #filter only 2019 data
+  filter(Facility.Type=="Bakery"|Facility.Type=="Grocery Store") %>% 
+  filter(Risk!="All")%>% # remove records whose risk level is ambiguous
+  filter(Results!="No Entry",Results!="Not Ready",Results!="Out of Business", Results!="Business Not Located") %>% #only keep pass, fail, and conditional pass
+  # get the unique food outlets from inspection data by address
+  arrange(Inspection.Date) %>% 
+  group_by(Address) %>% 
+  summarise_all(first) %>%
+  #create sf object after dropping the NA
+  drop_na() %>%
+  st_as_sf(coords = c("Longitude", "Latitude")) %>% # set coordinates
+  st_set_crs("EPSG:4326") #set crs
+
+
+
+st_write(fi_19,dsn = paste0("shapes/uniq_fi19.shp"),delete_dsn=T)
+
+```
+
+Now we will check frequencies of different attributes.
+```{r}
+# crosstabs
+xtabs(~Risk+Results, data=fi_19) 
+
+xtabs(~Facility.Type+Results, data=fi_19) 
+
+colnames(fi_19)
+```
+
+
+
+# aggregate records into census tracts
+
+## Getting the study area shapes 
+We will download the census tracts boundaries and Chicago city boundary.
+
+
+```{r, echo=TRUE, results = 'hide'}
+#downloading census tracts of Cook county
+
+ct <- tracts("Illinois", "Cook") %>% st_transform(crs = st_crs(fi_19))
+
+#downloading chicago city boundary
+chicago <- places("illinois") %>%
+  filter(NAME=="Chicago") %>%
+  st_transform(crs = st_crs(fi_19))
+```
+
+Then we will clip the tracts with the city boundary. The tract covering the lake should be removed. So we find out the GEOID of it and remove the shape by filtering the GEOID out. 
+```{r}
+# mapping Cook county and Chicago city
+tmap_mode("plot")
+tm_shape(ct) + tm_borders("gray") +
+  tm_shape(chicago) + tm_borders("orange", lwd = 3.5) +
+  tm_scale_bar(width = 0.32, position = c(0,.01)) + 
+  tm_compass(size=3,position = c(.1,.3)) + 
+  tm_layout(frame = T, title = "Census Tracts \nin Cook county (black)\n& Chicago city (orange)", 
+      title.size = 1.3, title.position = c(.54,.85), legend.outside = T, legend.position = c(.1,.5))
+
+# Clipping census tracts within city boundary
+ct_C <- ct[chicago,]
+
+# finding the GEOID of the lake and  removing that from filtered census tracts
+tm_shape(ct_C) + tm_borders("gray") + tm_text("GEOID") +
+  tm_shape(chicago) + tm_borders("orange", lwd = 3.5)
+
+# remove the particular tract
+ct_C <- filter(ct_C, GEOID!="17031990000")
+
+#save in local computer
+st_write(ct_C,dsn = paste0("shapes/chicago_ct.shp"),delete_dsn=T)
+
+
+```
+
+## Mapping under facilities
+
+Let's have a look at the simple distribution of different facilities overlaid on tracts.
+```{r}
+# mapping of all locations in one frame
+
+tm_shape(ct_C) + tm_borders("gray") +
+  tm_shape(chicago) + tm_borders("orange", lwd = 3.5) +
+  tm_shape(fi_19) + tm_dots("Results",alpha=0.5, size=.3, style = "cat",palette = "Spectral")+
+  tm_scale_bar(width = 0.32, position = c(0,.01)) + 
+  tm_compass(size=3,position = c(.8,.8)) + 
+  tm_layout(frame = T, title = "Food inspection \nin Chicago", 
+      title.size = 1, title.position = c(.05,.15), legend.outside = F, legend.position = c(0,.5))
+```
+
+
+
+```{r}
+# mapping of locations with different type and result in separate frame
+
+tm_shape(fi_19) + tm_dots("blue", size=0.4, alpha=0.5) + tm_facets(by=c("Facility.Type","Results"), ncol  =2, showNA = FALSE) +
+  tm_shape(ct_C) + tm_fill("black", alpha = 0, lwd = .5) + tm_borders("gray", lwd=0.2, alpha=0.4) +
+  tm_scale_bar(width = 0.32, position = c(0,.01)) + 
+  tm_compass(size=3,position = c(.8,.8)) + 
+  tm_layout(frame = T, 
+      title.size = 1, title.position = c(.05,.15), legend.outside = T, legend.position = c(.1,.5))
+
+```
+
+
+## getting acs variables
+We will download the sociodemographic variables from American Community Survey. We will collect population, number of white and black people, median household income, percentage of uninsured people, unemployment rate, percent of household with people under 18 years old and above 65 years old. Finally, we will join these datasets with the main census tract dataset (ct_C). 
+
+```{r}
+demo <- c(tot_pop = "B01003_001", #population
+          white_pop = "B01001A_001", # no of whites
+          race_total = "B02001_001", # total popualtion
+          race_black = "B02001_003")
+          #hisp_pop = "DP05_071") # no. of blacks
+eco <- c(med_income = "B06011_001", #median income
+         insur_perc = "S2701_C03_001", #insurance rate
+         unempl_rate="S2301_C04_001") #unemployment rate
+hh<- c(hh18_perc = "S1101_C01_010", # HH with under 18
+       hh65_perc = "S1101_C01_011") # HH with above 65
+
+# downloading acs 5 year estimate of 2019 data for Illinois in tract level
+demo_var <- get_acs(geography = "tract", 
+                    variables = demo, 
+                    output = "wide",
+                    year  = 2019,
+                    survey = "acs5",
+                    state = "IL")
+
+eco_var <- get_acs(geography = "tract", 
+                    variables = eco, 
+                    output = "wide",
+                    year  = 2019,
+                    survey = "acs5",
+                    state = "IL")
+
+
+hh_var <- get_acs(geography = "tract", 
+                    variables = hh, 
+                    output = "wide",
+                    year  = 2019,
+                    survey = "acs5",
+                    state = "IL")
+
+tracts19 <- left_join(demo_var,eco_var,by="GEOID")
+tracts19 <- left_join(tracts19,hh_var,by="GEOID")
+
+ct_C <- left_join(ct_C, tracts19, by = "GEOID")
+
+head(ct_C)
+
+
+```
+
+In this stage, we will aggregate the number of different facilities in each census tract. First, we will join the GEOIDs with the facilities that they fall in. 
+
+```{r}
+# join GEOID with inspection records
+
+fi_19 <- st_join(fi_19, ct_C["GEOID"])
+
+
+#let's have a look at the dataset structure
+str(fi_19)
+#also check how many points are outside of Chicago
+sum(is.na(fi_19$GEOID))
+
+#ct_C <- st_as_sf(ct_C)  #
+#ct_C <- spTransform(ct_C,crs(fi_19))
+```
+
+Then we will create dummies to indicate the attributes of the facilities. For aggregation, we will group by GEOID and summarize the dummies. In this way, we will get the counts of different types. We will join the aggregated data with the main census tract data by GEOID key. Finally, from the count, we will create the percentages of facilities in each tract that passed, failed, or conditionally passed. 
+```{r}
+# make dummy variables for summarizing
+fi19_df <- dummy_cols(fi_19, select_columns = c("Risk","Results", "Facility.Type"))
+
+colnames(fi_19)
+
+#aggregate by GEOID
+fi19_df <- fi19_df %>% st_drop_geometry() %>% group_by(GEOID) %>% summarise(high_risk = sum(`Risk_Risk 1 (High)`),medium_risk = sum(`Risk_Risk 2 (Medium)`), low_risk=sum(`Risk_Risk 3 (Low)`), pass=sum(Results_Pass), fail=sum(Results_Fail), cond_pass=sum(`Results_Pass w/ Conditions`),bakery=sum(Facility.Type_Bakery),grocery=sum(`Facility.Type_Grocery Store`))
+
+# join the aggregated table with block group dataframe 
+
+ct_C <-  left_join(ct_C, fi19_df, by="GEOID") 
+
+ct_C[is.na(ct_C)] = 0 # replace NA with 0
+
+
+summary(ct_C$pass) #examine one field
+
+ct_C <- ct_C %>% mutate(total=grocery+bakery)%>%
+  mutate(pass_perc = pass/total*100, fail_perc = fail/total*100, cond_pass_perc = cond_pass/total*100)
+
+```
+
+## map aggregated distributions of facilities
+```{r}
+
+tm_shape(ct_C) + tm_polygons("grocery", alpha=0.8, style = "jenks",palette = "Set3", 
+              border.alpha=0.7, title = "Number of \ngroceries") + tm_borders("gold", lty = "dashed") +
+  tm_scale_bar(width = 0.32, position = c(0,.01)) + 
+  tm_compass(size=3,position = c(.8,.7)) + 
+  tm_layout(frame = T, title = "Grocery", 
+      title.size = 1.5, title.position = c(.05,.5), legend.outside = F, legend.position = c(0,.1))
+
+
+
+tm_shape(ct_C) + tm_polygons("bakery", alpha=0.8, style = "cat",palette = "Set3", 
+              border.alpha=0.7, title = "Number of \nbakeries") + tm_borders("gold", lty = "dashed") +
+  tm_scale_bar(width = 0.32, position = c(0,.01)) + 
+  tm_compass(size=3,position = c(.8,.7)) + 
+  tm_layout(frame = T, title = "Bakery", 
+      title.size = 1.5, title.position = c(.05,.5), legend.outside = F, legend.position = c(0,.1))
+
+```
+
+## map aggregated distributions of the results of inspection
+
+```{r}
+p<-tm_shape(ct_C) + tm_polygons("pass_perc", alpha=0.8, style = "jenks",palette = "Spectral", 
+              border.alpha=0.3, title = "Percentage of \nfacility passed") + tm_borders("gold",lwd=0.1, lty = "dashed") +
+  tm_scale_bar(width = 0.32, position = c(0,.01)) + 
+  tm_compass(size=3,position = c(.8,.7)) + 
+  tm_layout(frame = T, title = "Pass", 
+      title.size = 1.5, title.position = c(.05,.5), legend.outside = F, legend.position = c(0,.1))
+
+
+
+f<-tm_shape(ct_C) + tm_polygons("fail_perc", alpha=0.8, style = "jenks",palette = "Set3", 
+              border.alpha=0.3, title = "Percent of \nfacility failed") + tm_borders("gold",lwd=0.1, lty = "dashed") +
+  tm_scale_bar(width = 0.32, position = c(0,.01)) + 
+  tm_compass(size=3,position = c(.8,.7)) + 
+  tm_layout(frame = T, title = "Fail", 
+      title.size = 1.5, title.position = c(.05,.5), legend.outside = F, legend.position = c(0,.1))
+
+cp<-tm_shape(ct_C) + tm_polygons("cond_pass_perc", alpha=0.8, style = "jenks",palette = "Set2", 
+              border.alpha=0.7, title = "Perc of facility \nconditionally \npassed") + tm_borders("gold", lwd=0.1,lty = "dashed") +
+  tm_scale_bar(width = 0.32, position = c(0,.01)) + 
+  tm_compass(size=3,position = c(.8,.7)) + 
+  tm_layout(frame = T, title = "Condional \nPass", 
+      title.size = 1.5, title.position = c(0,.6), legend.outside = F, legend.position = c(0,.1))
+
+tmap_arrange(p,f,cp)
+
+```
+
+
+# accessibility
+
+## Gathering data to calculate accessibility
+
+In the following code, we tried to collect the supply variable of food facilities (i.e., number of employees). However, several problems were encountered while doing so. 1.  Multiple business locations in one address were found which will take much time for us to clean. 2. Substantial amount of places do not match with business dataset and thus it reduces the number of facilities to analyze. So, we left this part for future extension of this work and hereby did not run the code in knitting.  
+
+```{r, eval=FALSE}
+# importing the business location dataset
+business <- read.csv("C:/study/1_OSU/fall 22/lab2/final project/business data/BUSINESS_HISTORICAL_2019/Business_2019_IL.csv", header = F) 
+
+
+population <- read.csv("C:/study/1_OSU/test/ACSDT5Y2020.B01003_2024-02-20T112330/ACSDT5Y2020.B01003-Data.csv")
+
+#select specified columns
+business <- business %>% subset(select=c("V1","V2","V10","V11","V13", "V15", "V47","V48")) 
+#rename column names
+colnames(business) <- c("Company", "Address", "Employee", "Sales","SIC", "NAICS", "Lattitude", "Longitude")
+
+
+
+#join business data (with multiple business in one address)
+fi19_biz <- left_join(uniq_fi19F, business,by="Address") 
+
+# finding frequency of facilities
+dup <- as.data.frame(table(fi19_biz$DBA.Name))
+
+#dup$Freq<- as.factor(dup$Freq)
+#dup$Freq<- as.integer(dup$Freq)
+#summary(dup$Freq)
+
+dup1 <- filter(dup, Freq==1)
+colnames(dup1)[1] = "DBA.Name"
+
+fi19_bizU <- inner_join(fi19_biz, dup1, by="DBA.Name")
+
+head(fi19_bizU)
+
+View(uniq_fi19)
+table(uniq_fi19F$Results)
+table(fi_19$Results)
+
+
+colnames(fi_19)
+dup_fi <- as.data.frame(table(fi_19$DBA.Name))
+nrow(dup_fi)
+View(uniq_fi19)
+
+x <- fi19_biz[grep(fi19_biz$DBA.Name, fi19_biz$Company), ]
+
+library(stringi)
+x <- str_detect(fi19_biz$DBA.Name, fi19_biz$Company)
+
+fi19_biz<- fi19_biz %>%
+  rowwise() %>%
+  mutate(matched = 
+           grepl(DBA.Name, Company)
+       )
+
+
+head(fi19_biz)
+
+
+
+View(fi19_bizDup)
+
+nrow(dup2_5)
+
+sum(dup_fi$Freq==1)
+
+sum(is.na(fi19_bizU$SIC))
+
+head(fi19_biz)
+nrow(fi19_bizU)
+```
+
+## getting the travel time matrix
+ 
+There are several ways to obtain travel time matrix which is a required part of 2SFCA calculation. We had technical issued in local computer while using R5R and Opentripplanner for travel time matrix. Therefore, we used ArcGIS Pro Network Analyst tool for this. With the centroid of census tracts as origin and locations of food outlets as destination, we calculated origin-destination matrix. In the following code, we first import the OD line layer from the geodatabase. Then we connect the originID (GEOID) and destinationID (Inspection ID) from origin and destination layer to the OD layer. With these keys, we can get the demographic information (population) and food inspection information (facility type, results, etc).
+
+```{r, eval=FALSE}
+fgdb <- "C:/study/1_OSU/fall 22/lab2/final project/food_inspection/food_inspection.gdb"
+
+# List all feature classes in a file geodatabase
+subset(ogrDrivers(), grepl("GDB", name))
+fc_list <- ogrListLayers(fgdb)
+print(fc_list) # to see which files I have in the geodatabase
+
+# Read the feature class
+fc <- readOGR(dsn=fgdb,layer="ODLinesieif3w") # read the lines (OD matrix)
+
+orig <- readOGR(dsn=fgdb,layer="Origins_SpatialJoin") %>% as.data.frame() # origin location
+dest <- readOGR(dsn=fgdb,layer="Dest_SpatialJoin")%>% as.data.frame() #destination location
+
+
+# rename
+colnames(orig)[2]="OriginID"
+colnames(dest)[2]="DestinationID"
+
+OD <- st_as_sf(fc)
+
+# join
+OD <- left_join(OD,orig,by="OriginID")
+OD <- left_join(OD,dest,by="DestinationID")
+
+OD <- OD %>% subset(select=c("Total_TravelTime","Total_Kilometers","GEOID","Insp_ID"))
+
+ct_pop <- ct_C %>% subset(select=c("GEOID","tot_popE")) %>% st_drop_geometry()
+
+OD <- left_join(OD,ct_pop,by="GEOID")
+colnames(OD)[4]="Inspection.ID"
+fi19_df <- fi_19 %>% st_drop_geometry()
+OD <- left_join(OD,fi19_df,by="Inspection.ID")
+
+head(OD)
+
+table(OD$Facility.Type)
+
+```
+
+The OD matrix is large containing 869,000 line features. So, we will write the processed matrix as dataframe and then import it again to save knitting time. 
+```{r, eval=FALSE}
+OD_df <- OD %>% st_drop_geometry()
+OD_csv <- write.csv(OD_df, "OD.csv")
+```
+
+```{r}
+# reading from local computer
+
+OD <- read.csv("OD.csv")
+colnames(OD)[4]="GEOID"
+
+OD$GEOID <- as.character(OD$GEOID)
+
+```
+
+
+## Calculating 2SFCA (without true supply variable)
+If we have the supply variable, the probable interpretation of the accessibility score would be the number of employees per certain number of population within certain travel time. Since we do not have it now, we used every facility with same weight which is simply their existence. So, we used 1 (for the count) and divided it by the population of catchment area to get the supply ratio. The interpretation now is the number of facilities per 1000 population within t travel time. 
+
+### passed grocery
+```{r}
+
+OD_filt <- filter(OD, Facility.Type=="Grocery Store", Results=="Pass") #filter the only records we need (e.g., passed groceries)
+
+supply_ratio <- OD_filt  %>%  
+  st_drop_geometry(OD_filt) %>%
+  filter(Total_TravelTime<15) %>% # Within certain travel time (travel time cutoff)
+  group_by(Inspection.ID) %>% # from each facility
+  filter(!is.na(tot_popE))%>%
+  summarise(sumpop=sum(tot_popE))%>% #count the population within the catchment
+  mutate(ratio = 1/sumpop) #this is the contribution of the facility to one person
+
+demand = merge(x=OD_filt, y=supply_ratio, by="Inspection.ID", all.x=TRUE) #additing this ratio table
+
+demand2 <- demand %>%
+  #st_drop_geometry(demand) %>%
+  filter(Total_TravelTime<15) %>% #within the catchment around census tract
+  group_by(GEOID)  %>% #from each census tract
+  summarise(ac_grocP=1000*sum(ratio)) %>% # taking taking sum of the ratios (contribution to one person) and multiply by 1000
+  st_drop_geometry()
+
+ct_C <- ct_C %>%  
+  left_join(demand2, by = "GEOID")
+
+colnames(fi_19)
+```
+
+### failed grocery
+
+```{r}
+
+OD_filt <- filter(OD, Facility.Type=="Grocery Store", Results=="Fail") 
+
+supply_ratio <- OD_filt  %>%  
+  st_drop_geometry(OD_filt) %>%
+  filter(Total_TravelTime<15) %>% 
+  group_by(Inspection.ID) %>% 
+  filter(!is.na(tot_popE))%>%
+  summarise(sumpop=sum(tot_popE))%>% 
+  mutate(ratio = 1/sumpop) 
+
+demand = merge(x=OD_filt, y=supply_ratio, by="Inspection.ID", all.x=TRUE)
+
+demand2 <- demand %>%
+  filter(Total_TravelTime<15) %>% 
+  group_by(GEOID)  %>% 
+  summarise(ac_grocF=1000*sum(ratio)) %>% 
+  st_drop_geometry()
+
+ct_C <- ct_C %>%  
+  left_join(demand2, by = "GEOID")
+```
+
+
+### grocery that passed with condition
+
+```{r}
+
+OD_filt <- filter(OD, Facility.Type=="Grocery Store", Results=="Pass w/ Conditions") 
+
+supply_ratio <- OD_filt  %>%  
+  st_drop_geometry(OD_filt) %>%
+  filter(Total_TravelTime<15) %>% 
+  group_by(Inspection.ID) %>% 
+  filter(!is.na(tot_popE))%>%
+  summarise(sumpop=sum(tot_popE))%>% 
+  mutate(ratio = 1/sumpop) 
+
+demand = merge(x=OD_filt, y=supply_ratio, by="Inspection.ID", all.x=TRUE)
+
+demand2 <- demand %>%
+  filter(Total_TravelTime<15) %>% 
+  group_by(GEOID)  %>% 
+  summarise(ac_groCP=1000*sum(ratio)) %>% 
+  st_drop_geometry()
+
+ct_C <- ct_C %>%  
+  left_join(demand2, by = "GEOID")
+```
+
+### Passed bakery
+
+```{r}
+
+OD_filt <- filter(OD, Facility.Type=="Bakery", Results=="Pass") 
+
+supply_ratio <- OD_filt  %>%  
+  st_drop_geometry(OD_filt) %>%
+  filter(Total_TravelTime<15) %>% 
+  group_by(Inspection.ID) %>% 
+  filter(!is.na(tot_popE))%>%
+  summarise(sumpop=sum(tot_popE))%>% 
+  mutate(ratio = 1/sumpop) 
+
+demand = merge(x=OD_filt, y=supply_ratio, by="Inspection.ID", all.x=TRUE)
+
+demand2 <- demand %>%
+  filter(Total_TravelTime<15) %>% 
+  group_by(GEOID)  %>% 
+  summarise(ac_bakP=1000*sum(ratio)) %>% 
+  st_drop_geometry()
+
+ct_C <- ct_C %>%  
+  left_join(demand2, by = "GEOID")
+```
+
+### Failed bakery
+
+```{r}
+
+OD_filt <- filter(OD, Facility.Type=="Bakery", Results=="Fail") 
+
+supply_ratio <- OD_filt  %>%  
+  st_drop_geometry(OD_filt) %>%
+  filter(Total_TravelTime<15) %>% 
+  group_by(Inspection.ID) %>% 
+  filter(!is.na(tot_popE))%>%
+  summarise(sumpop=sum(tot_popE))%>% 
+  mutate(ratio = 1/sumpop) 
+
+demand = merge(x=OD_filt, y=supply_ratio, by="Inspection.ID", all.x=TRUE)
+
+demand2 <- demand %>%
+  filter(Total_TravelTime<15) %>% 
+  group_by(GEOID)  %>% 
+  summarise(ac_bakF=1000*sum(ratio)) %>% 
+  st_drop_geometry()
+
+ct_C <- ct_C %>%  
+  left_join(demand2, by = "GEOID")
+```
+
+### Bakeries that passed with condition
+
+```{r}
+
+OD_filt <- filter(OD, Facility.Type=="Bakery", Results=="Pass w/ Conditions") 
+
+supply_ratio <- OD_filt  %>%  
+  st_drop_geometry(OD_filt) %>%
+  filter(Total_TravelTime<15) %>% 
+  group_by(Inspection.ID) %>% 
+  filter(!is.na(tot_popE))%>%
+  summarise(sumpop=sum(tot_popE))%>% 
+  mutate(ratio = 1/sumpop) 
+
+demand = merge(x=OD_filt, y=supply_ratio, by="Inspection.ID", all.x=TRUE)
+
+demand2 <- demand %>%
+  filter(Total_TravelTime<15) %>% 
+  group_by(GEOID)  %>% 
+  summarise(ac_bakCP=1000*sum(ratio)) %>% 
+  st_drop_geometry()
+
+ct_C <- ct_C %>%  
+  left_join(demand2, by = "GEOID")
+```
+
+## mapping the accessibilities
+
+```{r}
+
+gp<- tm_shape(ct_C) + tm_polygons(col="ac_grocP", alpha=0.8, style = "jenks",palette = "Spectral", 
+              border.alpha=0.7, title = "No. of Safe grocery \nper 10k population") + tm_borders("gold", lty = "dashed") +
+  tm_scale_bar(width = 0.32, position = c(0,.01)) + 
+  tm_compass(size=2,position = c(.1,.3)) + 
+  tm_layout(frame = T, title = "Accessibility", 
+      title.size = 2.5, title.position = c(.05,.9), legend.outside = T, legend.position = c(.1,.1))
+
+gf<- tm_shape(ct_C) + tm_polygons(col="ac_grocF", alpha=0.8, style = "jenks",palette = "Spectral", 
+              border.alpha=0.7, title = "No. of unsafe grocery \nper 10k population") + tm_borders("gold", lty = "dashed") +
+  tm_scale_bar(width = 0.32, position = c(0,.01)) + 
+  tm_compass(size=2,position = c(.1,.3)) + 
+  tm_layout(frame = T, title = "Accessibility", 
+      title.size = 2.5, title.position = c(.05,.9), legend.outside = T, legend.position = c(.1,.1))
+
+bp<- tm_shape(ct_C) + tm_polygons(col="ac_bakP", alpha=0.8, style = "jenks",palette = "Spectral", 
+              border.alpha=0.7, title = "No. of Safe Bakery \nper 10k population") + tm_borders("gold", lty = "dashed") +
+  tm_scale_bar(width = 0.32, position = c(0,.01)) + 
+  tm_compass(size=2,position = c(.1,.3)) + 
+  tm_layout(frame = T, title = "Accessibility", 
+      title.size = 2.5, title.position = c(.05,.9), legend.outside = T, legend.position = c(.1,.1))
+
+bf<- tm_shape(ct_C) + tm_polygons(col="ac_bakF", alpha=0.8, style = "jenks",palette = "Spectral", 
+              border.alpha=0.7, title = "No. of unsSafe bakery \nper 10k population") + tm_borders("gold", lty = "dashed") +
+  tm_scale_bar(width = 0.32, position = c(0,.01)) + 
+  tm_compass(size=2,position = c(.1,.3)) + 
+  tm_layout(frame = T, title = "Accessibility", 
+      title.size = 2.5, title.position = c(.05,.9), legend.outside = T, legend.position = c(.1,.1))
+
+gcp<- tm_shape(ct_C) + tm_polygons(col="ac_groCP", alpha=0.8, style = "jenks",palette = "Spectral", 
+              border.alpha=0.7, title = "No. of partially \nSafe grocery \nper 10k population") + tm_borders("gold", lty = "dashed") +
+  tm_scale_bar(width = 0.32, position = c(0,.01)) + 
+  tm_compass(size=2,position = c(.1,.3)) + 
+  tm_layout(frame = T, title = "Accessibility", 
+      title.size = 2.5, title.position = c(.05,.9), legend.outside = T, legend.position = c(.1,.1))
+
+bcp<- tm_shape(ct_C) + tm_polygons(col="ac_bakCP", alpha=0.8, style = "jenks",palette = "Spectral", 
+              border.alpha=0.7, title = "No. of partially \nsafe bakery \nper 10k population") + tm_borders("gold", lty = "dashed") +
+  tm_scale_bar(width = 0.32, position = c(0,.01)) + 
+  tm_compass(size=2,position = c(.1,.3)) + 
+  tm_layout(frame = T, title = "Accessibility", 
+      title.size = 2.5, title.position = c(.05,.9), legend.outside = T, legend.position = c(.1,.1))
+
+
+current.mode <- tmap_mode("plot")
+tmap_arrange(gp, gf, bp, bf, bcp,gcp , widths = c(.25, .75))
+tmap_mode(current.mode)
+
+
+tmap_save(bcp, filename = "C:/study/1_OSU/fall 22/lab2/final project/bcp.jpeg", dpi=300, width = 4, height = 5,units = "in")
+
+```
+
+# Relationship between accessibility and sociodemographic characteristics
+
+First, we are interested in knowing which areas have higher accessibility and which areas have lower accessibility. Also we want to know the difference between this relationships for safe (passed) and unsafe (failed) food outlets. Thirdly, the accessibility varies with travel time. Previously we used 15 minutes travel time. So, we are interested to know how the relationship changes with different accessibility measured by different distance. 
+
+So, we arranged a sensitivity analysis. First, we will calculate the accessibility scores for passed groceries with 9 different travel time threshold (from 10 min to 50 min, with 5 min interval). Second, we will model the access scores with the sociodemographic variables and store the coefficients in a data frame. This whole process is completed with a for loop. Lastly, we will process the dataframe in a way to use it later for the comparative analysis with failed groceries. To keep the extent of analysis limited, we will not analyze the bakeries here.
+
+(Since the for loops take huge amount of time, we will show the codes for only two travel time in a loop. The main report contains complete analytical output.)
+
+### model coefficient for passed groceries
+```{r}
+library(stats)
+library(data.table)
+ct_var <- ct_C %>% subset(select=c(med_incomeE,insur_percE, unempl_rateE,hh18_percE,hh65_percE,GEOID)) 
+OD_filt <- filter(OD, Facility.Type=="Grocery Store", Results=="Pass")
+time <- c(10,15)#,20,25,30,35,40,45,50)
+
+for(i in 1:length(time)){
+  #calculating accessibility
+  supply_ratio <- OD_filt  %>%  #spatial join facility with zip areas by GEOID and then taking sum
+    st_drop_geometry(OD_filt) %>%
+    filter(Total_TravelTime<time[i]) %>%
+    group_by(Inspection.ID) %>% 
+    filter(!is.na(tot_popE))%>%
+    summarise(sumpop=sum(tot_popE))%>%
+    mutate(ratio = 1/sumpop)
+  
+  demand = merge(x=OD_filt, y=supply_ratio, by="Inspection.ID", all.x=TRUE)
+  demand2 <- demand %>%
+    #st_drop_geometry(demand) %>%
+    filter(Total_TravelTime<time[i]) %>%
+    group_by(GEOID)  %>%
+    summarise(access=1000*sum(ratio)) %>%
+    st_drop_geometry()
+  ct_var <- ct_var %>%  
+    left_join(demand2, by = "GEOID")
+  #modeling access score
+  model <- lm(access~ med_incomeE+insur_percE+ unempl_rateE+hh18_percE+hh65_percE, data=ct_var)
+  ct_var <- ct_var %>% subset(select=-c(access)) # get ready for another loop
+
+  coeffx <- model$coefficients %>% as.data.frame() # get the coefficients
+  
+  colnames(coeffx) <- paste0("time",time[i])
+  # populate the data frame
+  if(i==1){coeff = coeffx } else{
+    coeff=cbind(coeffx,coeff)}
+}
+  
+# storing coefficient for future use
+
+groc_var <- data.frame(var=c("Intercept", "med_incomeE","insur_percE", "unempl_rateE","hh18_percE","hh65_percE"))
+
+coeff_p <- cbind(groc_var,coeff) 
+coeff_longP <- melt(coeff_p, id.vars=c("var"), value.names=c("coefficient")) %>% mutate(model="grocery pass")
+
+head(coeff_longP)
+
+```
+
+### model coefficient for failed groceries
+
+```{r}
+ct_var <- ct_C %>% subset(select=c(med_incomeE,insur_percE, unempl_rateE,hh18_percE,hh65_percE,GEOID))
+OD_filt <- filter(OD, Facility.Type=="Grocery Store", Results=="Fail")
+time <- c(10,15)#,20,25,30,35,40,45,50)
+
+for(i in 1:length(time)){
+  supply_ratio <- OD_filt  %>%  #spatial join facility with zip areas by GEOID and then taking sum
+    st_drop_geometry(OD_filt) %>%
+    filter(Total_TravelTime<time[i]) %>%
+    group_by(Inspection.ID) %>% 
+    filter(!is.na(tot_popE))%>%
+    summarise(sumpop=sum(tot_popE))%>%
+    mutate(ratio = 1/sumpop)
+  
+  demand = merge(x=OD_filt, y=supply_ratio, by="Inspection.ID", all.x=TRUE)
+  demand2 <- demand %>%
+    #st_drop_geometry(demand) %>%
+    filter(Total_TravelTime<time[i]) %>%
+    group_by(GEOID)  %>%
+    summarise(access=1000*sum(ratio)) %>%
+    st_drop_geometry()
+  ct_var <- ct_var %>%  
+    left_join(demand2, by = "GEOID")
+  
+  model <- lm(access~ med_incomeE+insur_percE+ unempl_rateE+hh18_percE+hh65_percE, data=ct_var)
+  ct_var <- ct_var %>% subset(select=-c(access))
+
+  coeffx <- model$coefficients %>% as.data.frame()
+  
+  colnames(coeffx) <- paste0("time",time[i])
+  
+  if(i==1){coeff = coeffx } else{
+    coeff=cbind(coeffx,coeff)}
+}
+
+ 
+head(coeff) 
+
+groc_var <- data.frame(var=c("Intercept", "med_incomeE","insur_percE", "unempl_rateE","hh18_percE","hh65_percE"))
+
+coeff_f <- cbind(groc_var,coeff) 
+coeff_longF <- melt(coeff_f, id.vars=c("var"), value.names=c("coefficient")) %>% mutate(model="grocery fail")
+
+head(coeff_longF)
+```
+
+### visualizing the comparison
+
+Now that both the coefficients are ready, we will bind them and show in a ggplot. 
+```{r}
+coeff_long <- rbind(coeff_longP,coeff_longF) # binding
+
+head(coeff_long)
+
+coeff_long$time <- gsub("[a-zA-Z ]", "", coeff_long$variable) %>% as.numeric() # changing times into numeric for better plotting
+coeff_long <- coeff_long %>% subset(select=-c(variable))
+
+
+coeff_plot <- coeff_long %>% 
+  ggplot() +
+  aes(x = time, y = value, color = model) +
+  geom_line(aes(group = model)) +
+  facet_grid(var ~ ., scales = "free") +
+  geom_hline(yintercept = 0, show.legend = T) +
+  geom_point() + xlab("travel time (min)") + ylab("coefficient of linear model (dv: accessibility score)")
+
+coeff_plot
+
+ggsave(coeff_plot, filename = "coeff_plot.jpeg", path="C:/study/1_OSU/fall 22/lab2/final project", dpi=300, width = 7, height = 8,units = "in")
+```
+
+## Evaluating equity
+Now since we have calculated the accessibility scores for both passed and failed facilities, we need to compare how every census tract is experiencing the accessibility. This is important to evaluate equity. For this analysis, we will not consider the conditionally passed facilities and focus on only passed and failed food outlets.
+
+### scatter plot of accessibility to safe and unsafe groceries and bakeries
+```{r}
+# delineating the regions
+library(grid)
+grob <- grobTree(textGrob("Advantaged", x=0.8,  y=0.2,gp=gpar(col="red")),
+                 textGrob("Have choice", x=0.8,  y=0.8,gp=gpar(col="red")),
+                 textGrob("Food desert", x=0.2,  y=0.2,gp=gpar(col="red")),
+                 textGrob("Under risk", x=0.2,  y=0.8,gp=gpar(col="red")))
+
+# plotting the scatters
+gro_sp <- ggplot(ct_C, aes(x=ac_grocP, y=ac_grocF)) +  geom_point() + 
+  geom_vline(xintercept = mean(ct_C$ac_grocP,na.rm=TRUE),color="red") + geom_hline(yintercept = mean(ct_C$ac_grocF,na.rm=TRUE),color="blue") + annotation_custom(grob)
+
+gro_sp
+
+
+bak_sp <- ggplot(ct_C, aes(x=ac_bakP, y=ac_bakF)) +  geom_point()  +
+  geom_vline(xintercept = mean(ct_C$ac_bakP,na.rm=TRUE),color="red") + geom_hline(yintercept = mean(ct_C$ac_bakF,na.rm=TRUE),color="blue") + annotation_custom(grob)
+bak_sp
+
+#ggsave(gro_sp, filename = "gro_sp.jpeg", path="C:/study/1_OSU/fall 22/lab2/final project", dpi=300, width = 8, height = 5,units = "in")
+```
+
+### Categorizing the tracts into equity regions
+According to the regions showed above, we will divide the tracts into four categories. 
+```{r}
+# setting up the cutoff values
+gpa <- mean(ct_C$ac_grocP, na.rm=T)
+gfa <- mean(ct_C$ac_grocF, na.rm=T)
+bpa <- mean(ct_C$ac_bakP, na.rm=T)
+bfa <- mean(ct_C$ac_bakF, na.rm=T)
+
+# defining the regions
+ct_C <- ct_C %>% mutate(G_class=case_when(ac_grocP>=gpa & ac_grocF>=gfa~"have choice",
+                                  ac_grocP<gpa & ac_grocF>gfa~"under risk",
+                                  ac_grocP<gpa & ac_grocF<gfa~"food desert",
+                                  ac_grocP>gpa & ac_grocF<gfa~"advantaged")) %>%
+  mutate(B_class=case_when(ac_bakP>bpa & ac_bakF>bfa~"have choice",
+                                  ac_bakP<bpa & ac_bakF>bfa~"under risk",
+                                  ac_bakP<bpa & ac_bakF<bfa~"food desert",
+                                  ac_bakP>bpa & ac_bakF<bfa~"advantaged"))
+# get the frequency
+table(ct_C$G_class)
+
+table(ct_C$B_class)
+
+#plotting
+equity_gro <- tm_shape(ct_C) + tm_polygons(col="G_class", alpha=0.8, style = "cat",palette = "Spectral", 
+              border.alpha=0.7, title = "types of food access \nequity status") + tm_borders("gold", lty = "dashed") +
+  tm_scale_bar(width = 0.32, position = c(0,.01)) + 
+  tm_compass(size=2,position = c(.1,.3)) + 
+  tm_layout(frame = T, title = "Equity of safe grocery", 
+      title.size = 1.5, title.position = c(.05,.9), legend.outside = T, legend.position = c(.1,.5))
+
+
+equity_bak <- tm_shape(ct_C) + tm_polygons(col="B_class", alpha=0.8, style = "cat",palette = "Spectral", 
+              border.alpha=0.7, title = "types of food access \nequity status") + tm_borders("gold", lty = "dashed") +
+  tm_scale_bar(width = 0.32, position = c(0,.01)) + 
+  tm_compass(size=2,position = c(.1,.3)) + 
+  tm_layout(frame = T, title = "Equity of safe bakery", 
+      title.size = 1.5, title.position = c(.05,.9), legend.outside = T, legend.position = c(.1,.5))
+
+
+tmap_arrange(equity_gro, equity_bak)
+```
+
+
+# Modeling the regions
+So, now we will understand the probability of a tract with certain sociodemographic characetristic to fall into different equity regions. First, we will create model for grocery equity regions and then for bakery equity regions.  
+
+```{r}
+library(nnet)
+
+#setting up the reference category
+
+ct_C$G_class <- as.factor(ct_C$G_class) %>% relevel(ct_C$G_class, ref = "advantaged")
+
+table(ct_C$G_class)
+
+# creating model for grocery equity category
+gro_class <- multinom(G_class ~ med_incomeE+insur_percE+ unempl_rateE+hh18_percE+hh65_percE, data = ct_C)
+
+
+library(sjPlot)
+
+
+tab_model(gro_class, show.loglik=T, show.se=F, show.ci = T, file = "C:/study/1_OSU/fall 22/lab2/final project/result_gro_class.xls")
+
+
+
+```
+
+
+## ploting predicted probability plot for grocery equity
+
+To visualize the relationship with different probabilities beyond model result table, plotting the predicted probabilities is a powerful way. We will plot the predictor variable (e.g., median income) in x axis and probaility of four regions in y axis. This code will do this for groceries.
+```{r}
+library(data.table)
+#predict the outcome
+pp.write <- cbind(ct_C, predict(gro_class, newdata = ct_C, type = "probs", se = TRUE)) %>% as.data.table()
+
+# craete dataframe with predicted probability of four categories for predictor variables
+for_plot <- pp.write %>% 
+  group_by(hh65_percE) %>% 
+  summarise(food_desert=mean(food.desert),have_choice=mean(have.choice),under_risk=mean(under.risk),advantage=mean(advantaged),) %>%
+  as.data.table()
+
+# make that in a long formate
+
+for_plot <-  melt(for_plot, id.vars=c("hh65_percE"), value.name = "probability")
+
+for_plot[,1] <- lapply(for_plot[,1], as.numeric)
+
+# plot
+p2 <- for_plot %>% 
+  ggplot() +
+  aes(x = hh65_percE, y = probability, color = variable) +
+  #geom_line(aes(group = variable)) +
+  geom_smooth(method=loess, se=T, fullrange=TRUE) +
+  geom_point(size=.5) + xlab("perc. of household with people above 65")
+
+p2
+#ggsave(p2, filename = "gro_class_a65.jpeg", path="C:/study/1_OSU/fall 22/lab2/final project", dpi=300, width = 8, height = 4,units = "in")
+
+
+```
+
+
+
+
+
